@@ -19,11 +19,114 @@ lnx_window_from_x11window(Window window)
   return result;
 }
 
+internal S32
+lnx_window_moveresize_dir_from_point(LNX_WM_Window *w, Vec2F32 p, Vec2F32 dim)
+{
+  F32 edge = w->custom_border_edge_thickness;
+  F32 title = w->custom_border_title_thickness;
+
+  for EachIndex(idx, w->title_bar_client_area_count)
+  {
+    Rng2F32 rect = w->title_bar_client_areas[idx];
+    if(rect.x0 <= p.x && p.x < rect.x1 &&
+       rect.y0 <= p.y && p.y < rect.y1)
+    {
+      return LNX_WM_MOVERESIZE_NONE;
+    }
+  }
+
+  B32 on_left   = (edge > 0 && p.x <= edge);
+  B32 on_right  = (edge > 0 && p.x >= dim.x - edge);
+  B32 on_top    = (edge > 0 && p.y <= edge);
+  B32 on_bottom = (edge > 0 && p.y >= dim.y - edge);
+  if(on_top && on_left)     { return LNX_WM_MOVERESIZE_SIZE_TOPLEFT; }
+  if(on_top && on_right)    { return LNX_WM_MOVERESIZE_SIZE_TOPRIGHT; }
+  if(on_bottom && on_left)  { return LNX_WM_MOVERESIZE_SIZE_BOTTOMLEFT; }
+  if(on_bottom && on_right) { return LNX_WM_MOVERESIZE_SIZE_BOTTOMRIGHT; }
+  if(on_left)               { return LNX_WM_MOVERESIZE_SIZE_LEFT; }
+  if(on_right)              { return LNX_WM_MOVERESIZE_SIZE_RIGHT; }
+  if(on_top)                { return LNX_WM_MOVERESIZE_SIZE_TOP; }
+  if(on_bottom)             { return LNX_WM_MOVERESIZE_SIZE_BOTTOM; }
+
+  if(title > 0 && p.y < title) { return LNX_WM_MOVERESIZE_MOVE; }
+
+  return LNX_WM_MOVERESIZE_NONE;
+}
+
+internal WM_Cursor
+lnx_wm_cursor_from_moveresize_dir(S32 dir)
+{
+  WM_Cursor result = WM_Cursor_COUNT;
+  switch(dir)
+  {
+    default:{}break;
+    case LNX_WM_MOVERESIZE_SIZE_LEFT:
+    case LNX_WM_MOVERESIZE_SIZE_RIGHT:       {result = WM_Cursor_LeftRight;}break;
+    case LNX_WM_MOVERESIZE_SIZE_TOP:
+    case LNX_WM_MOVERESIZE_SIZE_BOTTOM:      {result = WM_Cursor_UpDown;}break;
+    case LNX_WM_MOVERESIZE_SIZE_TOPLEFT:
+    case LNX_WM_MOVERESIZE_SIZE_BOTTOMRIGHT: {result = WM_Cursor_DownRight;}break;
+    case LNX_WM_MOVERESIZE_SIZE_TOPRIGHT:
+    case LNX_WM_MOVERESIZE_SIZE_BOTTOMLEFT:  {result = WM_Cursor_UpRight;}break;
+  }
+  return result;
+}
+
+internal void
+lnx_window_begin_moveresize(LNX_WM_Window *w, S32 root_x, S32 root_y, S32 dir, U32 button)
+{
+  XUngrabPointer(lnx_wm_state->display, CurrentTime);
+  XFlush(lnx_wm_state->display);
+  XClientMessageEvent msg = {0};
+  msg.type = ClientMessage;
+  msg.window = w->window;
+  msg.message_type = lnx_wm_state->net_wm_moveresize_atom;
+  msg.format = 32;
+  msg.data.l[0] = root_x;
+  msg.data.l[1] = root_y;
+  msg.data.l[2] = dir;
+  msg.data.l[3] = button;
+  msg.data.l[4] = 1; // source indication: normal application
+  XSendEvent(lnx_wm_state->display, XDefaultRootWindow(lnx_wm_state->display), False,
+             SubstructureRedirectMask|SubstructureNotifyMask, (XEvent *)&msg);
+  XFlush(lnx_wm_state->display);
+}
+
+internal void
+lnx_window_finish_frame_sync(WM_Window handle)
+{
+  if(wm_window_match(handle, wm_window_zero())) {return;}
+  LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
+  B32 did_set = 0;
+  if(w->sync_request_pending)
+  {
+    w->sync_request_pending = 0;
+    XSyncValue value;
+    XSyncIntsToValue(&value, (unsigned)(w->counter_value & 0xffffffff), (int)(w->counter_value >> 32));
+    XSyncSetCounter(lnx_wm_state->display, w->counter_xid, value);
+    did_set = 1;
+  }
+  if(w->extended_frame_pending)
+  {
+    w->extended_frame_pending = 0;
+    S64 even = w->extended_counter_value + 1;
+    w->extended_counter_value = even;
+    XSyncValue value;
+    XSyncIntsToValue(&value, (unsigned)(even & 0xffffffff), (int)(even >> 32));
+    XSyncSetCounter(lnx_wm_state->display, w->extended_counter_xid, value);
+    did_set = 1;
+  }
+  if(did_set)
+  {
+    XFlush(lnx_wm_state->display);
+  }
+}
+
 ////////////////////////////////
 //~ rjf: @per_os_impl Main Initialization API (Implemented Per-OS)
 
 internal void
-wm_init(void)
+wm_x11_init(void)
 {
   //- rjf: initialize basics
   Arena *arena = arena_alloc();
@@ -35,6 +138,8 @@ wm_init(void)
   lnx_wm_state->wm_delete_window_atom        = XInternAtom(lnx_wm_state->display, "WM_DELETE_WINDOW", 0);
   lnx_wm_state->wm_sync_request_atom         = XInternAtom(lnx_wm_state->display, "_NET_WM_SYNC_REQUEST", 0);
   lnx_wm_state->wm_sync_request_counter_atom = XInternAtom(lnx_wm_state->display, "_NET_WM_SYNC_REQUEST_COUNTER", 0);
+  lnx_wm_state->motif_wm_hints_atom          = XInternAtom(lnx_wm_state->display, "_MOTIF_WM_HINTS", 0);
+  lnx_wm_state->net_wm_moveresize_atom       = XInternAtom(lnx_wm_state->display, "_NET_WM_MOVERESIZE", 0);
   
   //- rjf: open im
   lnx_wm_state->xim = XOpenIM(lnx_wm_state->display, 0, 0, 0);
@@ -78,7 +183,7 @@ wm_init(void)
 //~ rjf: @per_os_impl Graphics System Info (Implemented Per-OS)
 
 internal WM_SystemInfo *
-wm_get_system_info(void)
+wm_x11_get_system_info(void)
 {
   return &lnx_wm_state->gfx_info;
 }
@@ -87,13 +192,13 @@ wm_get_system_info(void)
 //~ rjf: @per_os_impl Clipboards (Implemented Per-OS)
 
 internal void
-wm_set_clipboard_text(String8 string)
+wm_x11_set_clipboard_text(String8 string)
 {
   
 }
 
 internal String8
-wm_get_clipboard_text(Arena *arena)
+wm_x11_get_clipboard_text(Arena *arena)
 {
   String8 result = {0};
   return result;
@@ -103,7 +208,7 @@ wm_get_clipboard_text(Arena *arena)
 //~ rjf: @per_os_impl Windows (Implemented Per-OS)
 
 internal WM_Window
-wm_window_open(Rng2F32 rect, WM_WindowFlags flags, String8 title)
+wm_x11_window_open(Rng2F32 rect, WM_WindowFlags flags, String8 title)
 {
   Vec2F32 resolution = dim_2f32(rect);
   
@@ -154,6 +259,7 @@ wm_window_open(Rng2F32 rect, WM_WindowFlags flags, String8 title)
                ButtonReleaseMask|
                KeyPressMask|
                KeyReleaseMask|
+               StructureNotifyMask|
                FocusChangeMask);
   Atom protocols[] =
   {
@@ -165,9 +271,22 @@ wm_window_open(Rng2F32 rect, WM_WindowFlags flags, String8 title)
     XSyncValue initial_value;
     XSyncIntToValue(&initial_value, 0);
     w->counter_xid = XSyncCreateCounter(lnx_wm_state->display, initial_value);
+    w->extended_counter_xid = XSyncCreateCounter(lnx_wm_state->display, initial_value);
   }
-  XChangeProperty(lnx_wm_state->display, w->window, lnx_wm_state->wm_sync_request_counter_atom, XA_CARDINAL, 32, PropModeReplace, (U8 *)&w->counter_xid, 1);
-  
+  {
+    XID counters[2] = {w->counter_xid, w->extended_counter_xid};
+    XChangeProperty(lnx_wm_state->display, w->window, lnx_wm_state->wm_sync_request_counter_atom, XA_CARDINAL, 32, PropModeReplace, (U8 *)counters, 2);
+  }
+
+  {
+    LNX_MotifWMHints hints = {0};
+    hints.flags = MWM_HINTS_DECORATIONS;
+    hints.decorations = MWM_DECOR_NONE;
+    XChangeProperty(lnx_wm_state->display, w->window,
+                    lnx_wm_state->motif_wm_hints_atom, lnx_wm_state->motif_wm_hints_atom,
+                    32, PropModeReplace, (U8 *)&hints, sizeof(hints)/sizeof(long));
+  }
+
   //- rjf: create xic
   w->xic = XCreateIC(lnx_wm_state->xim,
                      XNInputStyle, XIMPreeditNothing|XIMStatusNothing,
@@ -187,7 +306,7 @@ wm_window_open(Rng2F32 rect, WM_WindowFlags flags, String8 title)
 }
 
 internal void
-wm_window_close(WM_Window handle)
+wm_x11_window_close(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -195,7 +314,7 @@ wm_window_close(WM_Window handle)
 }
 
 internal void
-wm_window_set_title(WM_Window handle, String8 title)
+wm_x11_window_set_title(WM_Window handle, String8 title)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   Temp scratch = scratch_begin(0, 0);
@@ -206,7 +325,7 @@ wm_window_set_title(WM_Window handle, String8 title)
 }
 
 internal void
-wm_window_first_paint(WM_Window handle)
+wm_x11_window_first_paint(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -215,7 +334,7 @@ wm_window_first_paint(WM_Window handle)
 }
 
 internal void
-wm_window_focus(WM_Window handle)
+wm_x11_window_focus(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -233,7 +352,7 @@ wm_window_focus(WM_Window handle)
 }
 
 internal B32
-wm_window_is_focused(WM_Window handle)
+wm_x11_window_is_focused(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return 0;}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -245,7 +364,7 @@ wm_window_is_focused(WM_Window handle)
 }
 
 internal B32
-wm_window_is_fullscreen(WM_Window handle)
+wm_x11_window_is_fullscreen(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return 0;}
   // TODO(rjf)
@@ -253,14 +372,14 @@ wm_window_is_fullscreen(WM_Window handle)
 }
 
 internal void
-wm_window_set_fullscreen(WM_Window handle, B32 fullscreen)
+wm_x11_window_set_fullscreen(WM_Window handle, B32 fullscreen)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   // TODO(rjf)
 }
 
 internal B32
-wm_window_is_maximized(WM_Window handle)
+wm_x11_window_is_maximized(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return 0;}
   // TODO(rjf)
@@ -268,14 +387,14 @@ wm_window_is_maximized(WM_Window handle)
 }
 
 internal void
-wm_window_set_maximized(WM_Window handle, B32 maximized)
+wm_x11_window_set_maximized(WM_Window handle, B32 maximized)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   // TODO(rjf)
 }
 
 internal B32
-wm_window_is_minimized(WM_Window handle)
+wm_x11_window_is_minimized(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return 0;}
   // TODO(rjf)
@@ -283,56 +402,66 @@ wm_window_is_minimized(WM_Window handle)
 }
 
 internal void
-wm_window_set_minimized(WM_Window handle, B32 minimized)
+wm_x11_window_set_minimized(WM_Window handle, B32 minimized)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   // TODO(rjf)
 }
 
 internal void
-wm_window_bring_to_front(WM_Window handle)
+wm_x11_window_bring_to_front(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   // TODO(rjf)
 }
 
 internal void
-wm_window_set_monitor(WM_Window handle, WM_Monitor monitor)
+wm_x11_window_set_monitor(WM_Window handle, WM_Monitor monitor)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
   // TODO(rjf)
 }
 
 internal void
-wm_window_clear_custom_border_data(WM_Window handle)
+wm_x11_window_clear_custom_border_data(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
-  // TODO(rjf)
+  LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
+  w->custom_border_title_thickness = 0;
+  w->custom_border_edge_thickness = 0;
+  w->title_bar_client_area_count = 0;
 }
 
 internal void
-wm_window_push_custom_title_bar(WM_Window handle, F32 thickness)
+wm_x11_window_push_custom_title_bar(WM_Window handle, F32 thickness)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
-  // TODO(rjf)
+  LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
+  w->custom_border_title_thickness = thickness;
 }
 
 internal void
-wm_window_push_custom_edges(WM_Window handle, F32 thickness)
+wm_x11_window_push_custom_edges(WM_Window handle, F32 thickness)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
-  // TODO(rjf)
+  LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
+  w->custom_border_edge_thickness = thickness;
 }
 
 internal void
-wm_window_push_custom_title_bar_client_area(WM_Window handle, Rng2F32 rect)
+wm_x11_window_push_custom_title_bar_client_area(WM_Window handle, Rng2F32 rect)
 {
   if(wm_window_match(handle, wm_window_zero())) {return;}
-  // TODO(rjf)
+  LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
+  if(w->title_bar_client_area_count < LNX_WM_MAX_TITLE_BAR_CLIENT_AREAS)
+  {
+    w->title_bar_client_areas[w->title_bar_client_area_count] = rect;
+    w->title_bar_client_area_count += 1;
+  }
 }
 
 internal Rng2F32
-wm_rect_from_window(WM_Window handle)
+wm_x11_rect_from_window(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return r2f32p(0, 0, 0, 0);}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -343,7 +472,7 @@ wm_rect_from_window(WM_Window handle)
 }
 
 internal Rng2F32
-wm_client_rect_from_window(WM_Window handle)
+wm_x11_client_rect_from_window(WM_Window handle)
 {
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
   XWindowAttributes atts = {0};
@@ -353,7 +482,7 @@ wm_client_rect_from_window(WM_Window handle)
 }
 
 internal F32
-wm_dpi_from_window(WM_Window handle)
+wm_x11_dpi_from_window(WM_Window handle)
 {
   // TODO(rjf)
   return 96.f;
@@ -363,7 +492,7 @@ wm_dpi_from_window(WM_Window handle)
 //~ rjf: @per_os_impl External Windows (Implemented Per-OS)
 
 internal WM_ExtWindow
-wm_focused_external_window(void)
+wm_x11_focused_external_window(void)
 {
   WM_ExtWindow result = {0};
   // TODO(rjf)
@@ -371,7 +500,7 @@ wm_focused_external_window(void)
 }
 
 internal void
-wm_focus_external_window(WM_ExtWindow handle)
+wm_x11_focus_external_window(WM_ExtWindow handle)
 {
   // TODO(rjf)
 }
@@ -380,7 +509,7 @@ wm_focus_external_window(WM_ExtWindow handle)
 //~ rjf: @per_os_impl Monitors (Implemented Per-OS)
 
 internal WM_MonitorArray
-wm_push_monitors_array(Arena *arena)
+wm_x11_push_monitors_array(Arena *arena)
 {
   WM_MonitorArray result = {0};
   // TODO(rjf)
@@ -388,7 +517,7 @@ wm_push_monitors_array(Arena *arena)
 }
 
 internal WM_Monitor
-wm_primary_monitor(void)
+wm_x11_primary_monitor(void)
 {
   WM_Monitor result = {0};
   // TODO(rjf)
@@ -396,7 +525,7 @@ wm_primary_monitor(void)
 }
 
 internal WM_Monitor
-wm_monitor_from_window(WM_Window window)
+wm_x11_monitor_from_window(WM_Window window)
 {
   WM_Monitor result = {0};
   // TODO(rjf)
@@ -404,21 +533,21 @@ wm_monitor_from_window(WM_Window window)
 }
 
 internal String8
-wm_name_from_monitor(Arena *arena, WM_Monitor monitor)
+wm_x11_name_from_monitor(Arena *arena, WM_Monitor monitor)
 {
   // TODO(rjf)
   return str8_zero();
 }
 
 internal Vec2F32
-wm_dim_from_monitor(WM_Monitor monitor)
+wm_x11_dim_from_monitor(WM_Monitor monitor)
 {
   // TODO(rjf)
   return v2f32(0, 0);
 }
 
 internal F32
-wm_dpi_from_monitor(WM_Monitor monitor)
+wm_x11_dpi_from_monitor(WM_Monitor monitor)
 {
   // TODO(rjf)
   return 96.f;
@@ -428,7 +557,7 @@ wm_dpi_from_monitor(WM_Monitor monitor)
 //~ rjf: @per_os_impl Events (Implemented Per-OS)
 
 internal void
-wm_send_wakeup_event(void)
+wm_x11_send_wakeup_event(void)
 {
   U64 dummy = 1;
   ssize_t size = LNX_RETRY_ON_EINTR(write(lnx_wm_state->wakeup_fd, &dummy, sizeof(dummy)));
@@ -436,7 +565,7 @@ wm_send_wakeup_event(void)
 }
 
 internal WM_EventList
-wm_get_events(Arena *arena, B32 wait)
+wm_x11_get_events(Arena *arena, B32 wait)
 {
   WM_EventList evts = {0};
   for(;;)
@@ -463,6 +592,7 @@ wm_get_events(Arena *arena, B32 wait)
       XEvent evt = {0};
       XNextEvent(lnx_wm_state->display, &evt);
       B32 set_mouse_cursor = 0;
+      WM_Cursor cursor_override = WM_Cursor_COUNT;
       switch(evt.type)
       {
         default:{}break;
@@ -606,6 +736,21 @@ wm_get_events(Arena *arena, B32 wait)
           
           // rjf: push event
           LNX_WM_Window *window = lnx_window_from_x11window(evt.xbutton.window);
+
+          if(evt.type == ButtonPress && evt.xbutton.button == Button1 && window != 0)
+          {
+            XWindowAttributes atts = {0};
+            XGetWindowAttributes(lnx_wm_state->display, window->window, &atts);
+            Vec2F32 dim = v2f32((F32)atts.width, (F32)atts.height);
+            Vec2F32 p = v2f32((F32)evt.xbutton.x, (F32)evt.xbutton.y);
+            S32 dir = lnx_window_moveresize_dir_from_point(window, p, dim);
+            if(dir != LNX_WM_MOVERESIZE_NONE)
+            {
+              lnx_window_begin_moveresize(window, evt.xbutton.x_root, evt.xbutton.y_root, dir, evt.xbutton.button);
+              break;
+            }
+          }
+
           if(key != WM_Key_Null)
           {
             WM_Event *e = wm_event_list_push_new(arena, &evts, evt.type == ButtonPress ? WM_EventKind_Press : WM_EventKind_Release);
@@ -628,12 +773,22 @@ wm_get_events(Arena *arena, B32 wait)
         //- rjf: mouse motion
         case MotionNotify:
         {
-          LNX_WM_Window *window = lnx_window_from_x11window(evt.xclient.window);
+          LNX_WM_Window *window = lnx_window_from_x11window(evt.xmotion.window);
           WM_Event *e = wm_event_list_push_new(arena, &evts, WM_EventKind_MouseMove);
           e->window.u64[0] = (U64)window;
           e->pos.x = (F32)evt.xmotion.x;
           e->pos.y = (F32)evt.xmotion.y;
           set_mouse_cursor = 1;
+
+          if(window != 0)
+          {
+            XWindowAttributes atts = {0};
+            XGetWindowAttributes(lnx_wm_state->display, window->window, &atts);
+            Vec2F32 dim = v2f32((F32)atts.width, (F32)atts.height);
+            Vec2F32 p = v2f32((F32)evt.xmotion.x, (F32)evt.xmotion.y);
+            S32 dir = lnx_window_moveresize_dir_from_point(window, p, dim);
+            cursor_override = lnx_wm_cursor_from_moveresize_dir(dir);
+          }
         }break;
         
         //- rjf: window focus/unfocus
@@ -647,6 +802,14 @@ wm_get_events(Arena *arena, B32 wait)
           e->window.u64[0] = (U64)window;
         }break;
         
+        case ConfigureNotify:
+        case Expose:
+        {
+          LNX_WM_Window *window = lnx_window_from_x11window(evt.xany.window);
+          WM_Event *e = wm_event_list_push_new(arena, &evts, WM_EventKind_Wakeup);
+          e->window.u64[0] = (U64)window;
+        }break;
+
         //- rjf: client messages
         case ClientMessage:
         {
@@ -661,12 +824,17 @@ wm_get_events(Arena *arena, B32 wait)
             LNX_WM_Window *window = lnx_window_from_x11window(evt.xclient.window);
             if(window != 0)
             {
-              window->counter_value = 0;
-              window->counter_value |= evt.xclient.data.l[2];
-              window->counter_value |= (evt.xclient.data.l[3] << 32);
-              XSyncValue value;
-              XSyncIntToValue(&value, window->counter_value);
-              XSyncSetCounter(lnx_wm_state->display, window->counter_xid, value);
+              S64 value = (S64)(((U64)(U32)evt.xclient.data.l[2]) | ((U64)(U32)evt.xclient.data.l[3] << 32));
+              window->counter_value = (U64)value;
+              window->sync_request_pending = 1;
+              S64 odd = value + (value & 1) + 1;
+              window->extended_counter_value = odd;
+              window->extended_frame_pending = 1;
+              XSyncValue odd_value;
+              XSyncIntsToValue(&odd_value, (unsigned)(odd & 0xffffffff), (int)(odd >> 32));
+              XSyncSetCounter(lnx_wm_state->display, window->extended_counter_xid, odd_value);
+              WM_Event *e = wm_event_list_push_new(arena, &evts, WM_EventKind_Wakeup);
+              e->window.u64[0] = (U64)window;
             }
           }
         }break;
@@ -674,6 +842,7 @@ wm_get_events(Arena *arena, B32 wait)
       
       if(set_mouse_cursor)
       {
+        WM_Cursor cursor = (cursor_override != WM_Cursor_COUNT) ? cursor_override : lnx_wm_state->last_set_cursor;
         Window root_window = 0;
         Window child_window = 0;
         int root_rel_x = 0;
@@ -683,7 +852,7 @@ wm_get_events(Arena *arena, B32 wait)
         unsigned int mask = 0;
         if(XQueryPointer(lnx_wm_state->display, XDefaultRootWindow(lnx_wm_state->display), &root_window, &child_window, &root_rel_x, &root_rel_y, &child_rel_x, &child_rel_y, &mask))
         {
-          XDefineCursor(lnx_wm_state->display, root_window, lnx_wm_state->cursors[lnx_wm_state->last_set_cursor]);
+          XDefineCursor(lnx_wm_state->display, root_window, lnx_wm_state->cursors[cursor]);
           XFlush(lnx_wm_state->display);
         }
       }
@@ -697,21 +866,21 @@ wm_get_events(Arena *arena, B32 wait)
 }
 
 internal WM_Modifiers
-wm_get_modifiers(void)
+wm_x11_get_modifiers(void)
 {
   // TODO(rjf)
   return 0;
 }
 
 internal B32
-wm_key_is_down(WM_Key key)
+wm_x11_key_is_down(WM_Key key)
 {
   // TODO(rjf)
   return 0;
 }
 
 internal Vec2F32
-wm_mouse_from_window(WM_Window handle)
+wm_x11_mouse_from_window(WM_Window handle)
 {
   if(wm_window_match(handle, wm_window_zero())) {return v2f32(0, 0);}
   LNX_WM_Window *w = (LNX_WM_Window *)handle.u64[0];
@@ -737,7 +906,7 @@ wm_mouse_from_window(WM_Window handle)
 //~ rjf: @per_os_impl Cursors (Implemented Per-OS)
 
 internal void
-wm_set_cursor(WM_Cursor cursor)
+wm_x11_set_cursor(WM_Cursor cursor)
 {
   lnx_wm_state->last_set_cursor = cursor;
 }
@@ -746,7 +915,7 @@ wm_set_cursor(WM_Cursor cursor)
 //~ rjf: @per_os_impl Native User-Facing Graphical Messages (Implemented Per-OS)
 
 internal void
-wm_graphical_message(B32 error, String8 title, String8 message)
+wm_x11_graphical_message(B32 error, String8 title, String8 message)
 {
   if(error)
   {
@@ -757,7 +926,7 @@ wm_graphical_message(B32 error, String8 title, String8 message)
 }
 
 internal String8
-wm_graphical_pick_file(Arena *arena, String8 title, String8 initial_path)
+wm_x11_graphical_pick_file(Arena *arena, String8 title, String8 initial_path)
 {
   return str8_zero();
 }
@@ -766,13 +935,13 @@ wm_graphical_pick_file(Arena *arena, String8 title, String8 initial_path)
 //~ rjf: @per_os_impl Shell Operations
 
 internal void
-wm_show_in_filesystem_ui(String8 path)
+wm_x11_show_in_filesystem_ui(String8 path)
 {
   // TODO(rjf)
 }
 
 internal void
-wm_open_in_browser(String8 url)
+wm_x11_open_in_browser(String8 url)
 {
   // TODO(rjf)
 }
